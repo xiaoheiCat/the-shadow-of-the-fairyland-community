@@ -74,17 +74,25 @@ jobs:
               return !!text && /<!--\s*sync-write:/.test(text);
             }
 
-            // ✅ 防循环：评论事件只看 comment；issue 事件才看 issue.body
+            // 防循环
+            const action = context.payload.action; // opened/edited/closed/reopened/labeled...
             if (isCommentEvent) {
+              // 评论事件：只要评论本身带 sync-write 就跳过
               if (hasSyncWriteTag(context.payload.comment?.body)) {
                 core.info("Skip: comment contains sync-write tag.");
                 return;
               }
             } else {
-              if (hasSyncWriteTag(payloadIssue.body)) {
-                core.info("Skip: issue body contains sync-write tag.");
+              // issues 事件：只在“确实是 edited 且改动了 title/body”时才跳过
+              const editedTitle = !!context.payload.changes?.title;
+              const editedBody  = !!context.payload.changes?.body;
+              const isRealContentEdit = action === "edited" && (editedTitle || editedBody);
+            
+              if (isRealContentEdit && hasSyncWriteTag(payloadIssue.body)) {
+                core.info("Skip: edited issue content contains sync-write tag.");
                 return;
               }
+              // reopened/closed/labeled... 不再因为 body 有 sync-write 而跳过
             }
 
             // ---------- API helpers ----------

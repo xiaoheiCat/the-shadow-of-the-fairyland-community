@@ -1,0 +1,39 @@
+name: Auto close pull requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  close_pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment and close PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+
+            const body = "抱歉，本仓库暂不接受任何拉取请求。";
+
+            // 1) Comment (PR comments are issue comments)
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: pull_number,
+              body
+            });
+
+            // 2) Close PR
+            await github.rest.pulls.update({
+              owner,
+              repo,
+              pull_number,
+              state: "closed"
+            });

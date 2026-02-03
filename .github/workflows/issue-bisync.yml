@@ -41,29 +41,30 @@ jobs:
               return;
             }
             const [peerOwner, peerRepo] = peerRepoFull.split("/");
-
+            
             const srcOwner = context.repo.owner;
             const srcRepo  = context.repo.repo;
-
-            // 仅处理 issue 与 issue_comment 事件
+            
             const payloadIssue = context.payload.issue;
             if (!payloadIssue) {
               core.info("No issue in event payload; nothing to do.");
               return;
             }
-
-            // ---------- 同步标记：用于映射与防循环 ----------
-            // 1) 记录对端 issue 映射：<!-- sync-peer:owner/repo#123 -->
-            // 2) 防循环：任何由同步写入的正文/评论都带 <!-- sync-write:... -->
+            
+            // 事件类型
+            const isCommentEvent = !!context.payload.comment;
+            const isIssueEvent = !isCommentEvent;
+            
+            // ---------- 同步标记 ----------
             const PEER_PREFIX = "<!-- sync-peer:";
             const PEER_SUFFIX = "-->";
             const WRITE_TAG_PREFIX = "<!-- sync-write:";
             const WRITE_TAG_RE = /<!--\s*sync-write:[\s\S]*?-->/g;
-
+            
             function buildPeerMark(owner, repo, number) {
               return `${PEER_PREFIX}${owner}/${repo}#${number}${PEER_SUFFIX}`;
             }
-
+            
             function extractPeerFromBody(body) {
               if (!body) return null;
               const re = /<!--\s*sync-peer:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#(\d+)\s*-->/;
@@ -71,37 +72,37 @@ jobs:
               if (!m) return null;
               return { owner: m[1], repo: m[2], number: Number(m[3]) };
             }
-
+            
             function hasSyncWriteTag(text) {
               if (!text) return false;
               return /<!--\s*sync-write:/.test(text);
             }
-
-            // 如果本次事件的变更内容本身是同步写入产生的，就跳过（防 ping-pong）
-            if (context.payload.comment?.body && hasSyncWriteTag(context.payload.comment.body)) {
-              core.info("Skip: comment contains sync-write tag.");
-              return;
+            
+            // ✅ 防循环：按事件类型判断（这是你评论不同步的根因）
+            if (isCommentEvent) {
+              if (hasSyncWriteTag(context.payload.comment?.body)) {
+                core.info("Skip: comment contains sync-write tag.");
+                return;
+              }
+            } else {
+              if (hasSyncWriteTag(payloadIssue.body)) {
+                core.info("Skip: issue body contains sync-write tag.");
+                return;
+              }
             }
-            if (payloadIssue.body && hasSyncWriteTag(payloadIssue.body)) {
-              core.info("Skip: issue body contains sync-write tag.");
-              return;
-            }
-
-            // ---------- GitHub API helpers ----------
+            
+            // ---------- API helpers ----------
             async function getIssue(owner, repo, number) {
               const { data } = await github.rest.issues.get({ owner, repo, issue_number: number });
               return data;
             }
-
             async function updateIssue(owner, repo, number, patch) {
               await github.rest.issues.update({ owner, repo, issue_number: number, ...patch });
             }
-
             async function createIssue(owner, repo, payload) {
               const { data } = await github.rest.issues.create({ owner, repo, ...payload });
               return data;
             }
-
             async function listAllComments(owner, repo, number) {
               const all = [];
               let page = 1;
@@ -115,7 +116,7 @@ jobs:
               }
               return all;
             }
-
+            
             function normalizeLabels(issue) {
               return (issue.labels || []).map(l => (typeof l === "string" ? l : l.name)).filter(Boolean);
             }
@@ -125,121 +126,106 @@ jobs:
             function milestoneNumber(issue) {
               return issue.milestone ? issue.milestone.number : null;
             }
-
-            // ---------- 取最新源 issue（payload 未必是最新） ----------
+            
+            // ---------- 最新源 issue ----------
             const srcNumber = payloadIssue.number;
             const freshSrc = await getIssue(srcOwner, srcRepo, srcNumber);
-
-            // ---------- 找对端映射；没有就创建 ----------
-            let peerRef = extractPeerFromBody(freshSrc.body);
-            let peerIssue;
-
-            // 构造一个本次 run 的写入标签（用于防循环/可追踪）
+            
             const runWriteTag = `${WRITE_TAG_PREFIX}${srcOwner}/${srcRepo}#${srcNumber} run:${context.runId} -->`;
-
+            
             function stripWriteTags(text) {
               if (!text) return text;
               return text.replace(WRITE_TAG_RE, "").trim();
             }
-
-            // 确保 body 同时包含：映射标记 + 写入标记（写入标记用于防循环）
+            
             function ensureMarksOnBody(body, mappingMark, writeTag) {
               let b = body || "";
               if (!b.includes(mappingMark)) b = `${b}\n\n${mappingMark}\n`;
               if (!b.includes(writeTag)) b = `${b}\n${writeTag}\n`;
               return b.trim();
             }
-
+            
+            // ---------- 找/建对端 ----------
+            let peerRef = extractPeerFromBody(freshSrc.body);
+            let peerIssue;
+            
             if (!peerRef) {
               core.info("No peer mapping found. Creating peer issue...");
-
+            
               const mappingBackToSrc = buildPeerMark(srcOwner, srcRepo, srcNumber);
-
-              // 在对端新建 issue：带“回指源”的映射 + 写入标记
               const createBody = ensureMarksOnBody(
-                freshSrc.body || "",
+                stripWriteTags(freshSrc.body || ""),
                 mappingBackToSrc,
                 `${WRITE_TAG_PREFIX}${srcOwner}/${srcRepo}#${srcNumber} create run:${context.runId} -->`
               );
-
-              // 注意：labels/assignees/milestone 同步可能因对端不存在而失败；创建时先尽量带上
-              const createPayload = {
-                title: freshSrc.title,
-                body: createBody
-              };
-
-              // 这些字段有时会因为权限/不存在而报错；创建时做容错
+            
+              const createPayload = { title: freshSrc.title, body: createBody };
               try { createPayload.labels = normalizeLabels(freshSrc); } catch {}
               try { createPayload.assignees = normalizeAssignees(freshSrc); } catch {}
               try {
                 const ms = milestoneNumber(freshSrc);
                 if (ms) createPayload.milestone = ms;
               } catch {}
-
+            
               peerIssue = await createIssue(peerOwner, peerRepo, createPayload);
-
-              // 把对端映射写回源 issue
+            
+              // 写回源 issue 的映射（注意：这里会把 sync-write 写进源 body，这是正常的）
               const mappingToPeer = buildPeerMark(peerOwner, peerRepo, peerIssue.number);
-              const newSrcBody = ensureMarksOnBody(freshSrc.body || "", mappingToPeer, runWriteTag);
+              const newSrcBody = ensureMarksOnBody(stripWriteTags(freshSrc.body || ""), mappingToPeer, runWriteTag);
               await updateIssue(srcOwner, srcRepo, srcNumber, { body: newSrcBody });
-
+            
               peerRef = { owner: peerOwner, repo: peerRepo, number: peerIssue.number };
               core.info(`Created peer: ${peerOwner}/${peerRepo}#${peerIssue.number}`);
             } else {
               peerIssue = await getIssue(peerRef.owner, peerRef.repo, peerRef.number);
               core.info(`Found peer: ${peerRef.owner}/${peerRef.repo}#${peerRef.number}`);
             }
-
-            // ---------- 同步 issue 字段（源 -> 目标） ----------
+            
+            // ---------- 同步 issue 字段 ----------
             async function syncIssueFields(src, dstRef) {
-              // 目标 body：以源 body 为主，但追加“回指源映射”+ 写入标签
               const mappingBackToSrc = buildPeerMark(srcOwner, srcRepo, srcNumber);
               const cleanBody = stripWriteTags(src.body || "");
               const newDstBody = ensureMarksOnBody(cleanBody, mappingBackToSrc, runWriteTag);
-
-              const patch = {
-                title: src.title,
-                body: newDstBody,
-                state: src.state
-              };
-
-              // 下面字段可能失败（对端用户/里程碑不存在、权限策略等），所以做容错，不影响主同步
+            
+              const patch = { title: src.title, body: newDstBody, state: src.state };
+            
+              // 容错
               try { patch.labels = normalizeLabels(src); } catch (e) { core.info(`labels sync skipped: ${e.message}`); }
               try { patch.assignees = normalizeAssignees(src); } catch (e) { core.info(`assignees sync skipped: ${e.message}`); }
-              try {
-                const ms = milestoneNumber(src);
-                patch.milestone = ms ? ms : null;
-              } catch (e) { core.info(`milestone sync skipped: ${e.message}`); }
-
+              try { patch.milestone = milestoneNumber(src); } catch (e) { core.info(`milestone sync skipped: ${e.message}`); }
+            
               await updateIssue(dstRef.owner, dstRef.repo, dstRef.number, patch);
             }
-
-            // ---------- 同步评论（增量去重） ----------
-            // 每条同步过去的评论都带：<!-- sync-comment-id:123456 -->
+            
+            // ---------- 同步评论（增量去重 + 作者前缀） ----------
             function commentTag(srcCommentId) {
               return `<!-- sync-comment-id:${srcCommentId} -->`;
             }
-
+            
             async function syncComments(srcRef, dstRef) {
               const srcComments = await listAllComments(srcRef.owner, srcRef.repo, srcRef.number);
               const dstComments = await listAllComments(dstRef.owner, dstRef.repo, dstRef.number);
-
+            
               const dstJoined = dstComments.map(c => c.body || "").join("\n");
-
+            
               for (const c of srcComments) {
-                // 如果源评论本身是同步写入的，就不再同步（防循环）
+                // 源评论若为同步写入，则不再同步（防循环）
                 if (hasSyncWriteTag(c.body || "")) continue;
-
+            
                 const tag = commentTag(c.id);
                 if (dstJoined.includes(tag)) continue;
-
+            
+                const login = c.user?.login || "unknown";
+                const url = c.user?.html_url || `https://github.com/${login}`;
+                const authorPrefix = `[${login}](${url}): `;
+            
                 const body =
-                  `${c.body || ""}\n\n` +
+                  `${authorPrefix}\n\n${c.body || ""}\n\n` +
                   `---\n` +
                   `> Synced from ${srcRef.owner}/${srcRef.repo}#${srcRef.number}\n` +
                   `${tag}\n` +
                   `${WRITE_TAG_PREFIX}${srcRef.owner}/${srcRef.repo}#${srcRef.number} comment run:${context.runId} -->`;
-
+            
                 await github.rest.issues.createComment({
                   owner: dstRef.owner,
                   repo: dstRef.repo,
@@ -248,11 +234,12 @@ jobs:
                 });
               }
             }
-
+            
             const srcRef = { owner: srcOwner, repo: srcRepo, number: srcNumber };
             const dstRef = { owner: peerRef.owner, repo: peerRef.repo, number: peerRef.number };
-
+            
+            // 每次事件都先对齐 issue 字段，再补齐评论（这样最稳）
             await syncIssueFields(freshSrc, dstRef);
             await syncComments(srcRef, dstRef);
-
+            
             core.info(`Done: ${srcOwner}/${srcRepo}#${srcNumber} <-> ${dstRef.owner}/${dstRef.repo}#${dstRef.number}`);

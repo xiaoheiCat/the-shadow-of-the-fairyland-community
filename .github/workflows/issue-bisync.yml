@@ -37,7 +37,7 @@ jobs:
           script: |
             // github-script@v7 注入：core / github / context
 
-            const peerRepoFull = process.env.SYNC_PEER_REPO; // e.g. "xiaoheiCat/repoB"
+            const peerRepoFull = process.env.SYNC_PEER_REPO; // "owner/repo"
             if (!peerRepoFull || !peerRepoFull.includes("/")) {
               core.setFailed("Missing/invalid vars.SYNC_PEER_REPO (expected owner/repo).");
               return;
@@ -56,10 +56,9 @@ jobs:
             const isCommentEvent = !!context.payload.comment;
 
             // ---------- 标记 ----------
-            // 映射：<!-- sync-peer:owner/repo#123 -->
-            // 防循环：<!-- sync-write:... -->
-            const PEER_RE = /<!--\s*sync-peer:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#(\d+)\s*-->/g;
-            const WRITE_TAG_RE = /<!--\s*sync-write:[\s\S]*?-->/g;
+            const PEER_RE   = /<!--\s*sync-peer:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#(\d+)\s*-->/g;
+            const WRITE_RE  = /<!--\s*sync-write:[\s\S]*?-->/g;
+            const ORIGIN_RE = /<!--\s*sync-origin:([A-Za-z0-9_.-]+)\|([^\s]+)\s*-->/g;
             const COMMENT_ID_RE = /<!--\s*sync-comment-id:\d+\s*-->/g;
 
             function buildPeerMark(owner, repo, number) {
@@ -68,7 +67,9 @@ jobs:
             function buildWriteTag(text) {
               return `<!-- sync-write:${text} -->`;
             }
-
+            function buildOriginMark(login, url) {
+              return `<!-- sync-origin:${login}|${url} -->`;
+            }
             function hasSyncWriteTag(text) {
               return !!text && /<!--\s*sync-write:/.test(text);
             }
@@ -122,9 +123,14 @@ jobs:
               return issue.milestone ? issue.milestone.number : null;
             }
 
-            function authorPrefixFromUser(user) {
+            function userToLoginUrl(user) {
               const login = user?.login || "unknown";
               const url = user?.html_url || `https://github.com/${login}`;
+              return { login, url };
+            }
+
+            function authorPrefix(login, url) {
+              // 你要求的格式（带冒号）
               return `[${login}](${url}):`;
             }
 
@@ -132,26 +138,46 @@ jobs:
               return `> Synced from ${owner}/${repo}#${number}`;
             }
 
-            // ---------- 核心修复：剥离“我们管理的内容” ----------
-            // 1) 去掉 sync-peer / sync-write / sync-comment-id
-            // 2) 去掉我们追加的 footer（--- + > Synced from ...），避免重复和误解析
-            function stripManagedFromIssueBody(body) {
-              let b = body || "";
-              b = b.replace(WRITE_TAG_RE, "");
-              b = b.replace(PEER_RE, "");
-              b = b.replace(COMMENT_ID_RE, "");
-
-              // 去掉 footer：从分隔线开始到结尾（只要里面出现 Synced from 就认为是我们写的）
-              // 兼容你看到的 “Synced from #101” 以及 “Synced from owner/repo#101”
-              b = b.replace(/\n---\n(?:[^\n]*\n)*?>\s*Synced from[^\n]*\n?([\s\S]*)?$/m, "\n");
-
-              // 去掉可能残留的单行
-              b = b.replace(/^>\s*Synced from.*$/gm, "");
-              b = b.trim();
-              return b;
+            // ---------- 关键：解析/固定 origin author ----------
+            function extractOrigin(body) {
+              if (!body) return null;
+              const ms = [...body.matchAll(ORIGIN_RE)];
+              if (ms.length === 0) return null;
+              // 取最后一个，避免历史残留
+              const m = ms[ms.length - 1];
+              return { login: m[1], url: m[2] };
             }
 
-            // ---------- 核心修复：解析 peer 映射时“优先选指向配置对端的那条” ----------
+            // ---------- 关键：剥离“我们管理的内容”，避免前缀叠加 ----------
+            function stripLeadingAuthorPrefix(text) {
+              if (!text) return text;
+              const lines = text.split("\n");
+              // 匹配类似：[user](https://github.com/user):
+              const first = (lines[0] || "").trim();
+              if (/^\[[^\]]+\]\((https?:\/\/[^\)]+)\):?$/.test(first) || /^[A-Za-z0-9_.-]+\[bot\]:?$/.test(first)) {
+                // 去掉第一行，以及紧跟的一个空行
+                lines.shift();
+                if ((lines[0] || "").trim() === "") lines.shift();
+              }
+              return lines.join("\n").trim();
+            }
+
+            function stripManagedFromIssueBody(body) {
+              let b = body || "";
+              b = b.replace(WRITE_RE, "");
+              b = b.replace(PEER_RE, "");
+              b = b.replace(ORIGIN_RE, "");
+              b = b.replace(COMMENT_ID_RE, "");
+
+              // 去掉我们 footer（--- + Synced from）
+              b = b.replace(/\n---\n(?:[^\n]*\n)*?>\s*Synced from[^\n]*\n?([\s\S]*)?$/m, "\n");
+              b = b.replace(/^>\s*Synced from.*$/gm, "");
+
+              b = stripLeadingAuthorPrefix(b);
+              return b.trim();
+            }
+
+            // ---------- peer 映射：优先选指向 vars.SYNC_PEER_REPO 的 ----------
             function extractPeerPreferred(body) {
               if (!body) return null;
               const matches = [];
@@ -160,15 +186,12 @@ jobs:
               }
               if (matches.length === 0) return null;
 
-              // 1) 优先选指向 vars.SYNC_PEER_REPO 的
               const preferred = matches.find(x => x.owner === peerOwner && x.repo === peerRepo);
               if (preferred) return preferred;
 
-              // 2) 其次选“不指向自己仓库”的（避免写回本仓库）
               const notSelf = matches.find(x => !(x.owner === selfOwner && x.repo === selfRepo));
               if (notSelf) return notSelf;
 
-              // 3) 最后兜底
               return matches[0];
             }
 
@@ -176,69 +199,63 @@ jobs:
             const srcNumber = payloadIssue.number;
             const freshSrc = await getIssue(selfOwner, selfRepo, srcNumber);
 
-            // 运行写入标记（防循环）
             const runWriteTag = buildWriteTag(`${selfOwner}/${selfRepo}#${srcNumber} run:${context.runId}`);
 
+            // 确定 origin：优先 body 里的 sync-origin；没有就用当前 issue 的 user（第一次创建时是人）
+            const originFromBody = extractOrigin(freshSrc.body);
+            const fallbackOrigin = userToLoginUrl(freshSrc.user);
+            const origin = originFromBody || fallbackOrigin;
+
             // ---------- 找/建对端 ----------
-            // 注意：映射只存一条：当前仓库 issue -> 对端仓库 issue
             let peerRef = extractPeerPreferred(freshSrc.body);
 
-            // 如果 peerRef 意外指向自己，直接报错（避免把数据写回自己）
             if (peerRef && peerRef.owner === selfOwner && peerRef.repo === selfRepo) {
-              core.setFailed(
-                `sync-peer mapping points to self (${selfOwner}/${selfRepo}#${peerRef.number}). ` +
-                `This indicates corrupted markers or wrong SYNC_PEER_REPO.`
-              );
+              core.setFailed(`sync-peer mapping points to self (${selfOwner}/${selfRepo}#${peerRef.number}). Check markers/vars.`);
               return;
             }
 
-            let peerIssue;
-
-            // 组装“正文主体”（不含 hidden markers）
-            function buildManagedIssueBodyForTarget(srcIssue) {
-              const prefix = authorPrefixFromUser(srcIssue.user);
+            function buildIssueBodyForTarget(srcIssue) {
+              // 关键：作者用 origin，不用 srcIssue.user（避免 annshawn-bot 变作者）
               const main = stripManagedFromIssueBody(srcIssue.body || "");
               return [
-                `${prefix}`,
+                authorPrefix(origin.login, origin.url),
                 "",
-                `${main}`,
+                main,
                 "",
                 "---",
-                `${syncedFromLine(selfOwner, selfRepo, srcNumber)}`
+                syncedFromLine(selfOwner, selfRepo, srcNumber)
               ].join("\n").trim();
             }
 
+            let peerIssue;
             if (!peerRef) {
               core.info("No peer mapping found. Creating peer issue...");
 
-              const createBodyMain = buildManagedIssueBodyForTarget(freshSrc);
+              const createMain = buildIssueBodyForTarget(freshSrc);
 
-              // 对端 issue body：主体 +（末尾追加：sync-peer(回指源) + sync-write）
-              const peerBackMark = buildPeerMark(selfOwner, selfRepo, srcNumber);
-              const createBody = [
-                createBodyMain,
+              // 对端 body 末尾只保留：origin + back peer + write
+              const body = [
+                createMain,
                 "",
-                peerBackMark,
+                buildOriginMark(origin.login, origin.url),
+                buildPeerMark(selfOwner, selfRepo, srcNumber),
                 runWriteTag
               ].join("\n").trim();
 
-              const createPayload = { title: freshSrc.title, body: createBody };
+              const createPayload = { title: freshSrc.title, body };
               try { createPayload.labels = normalizeLabels(freshSrc); } catch {}
               try { createPayload.assignees = normalizeAssignees(freshSrc); } catch {}
-              try {
-                const ms = milestoneNumber(freshSrc);
-                if (ms) createPayload.milestone = ms;
-              } catch {}
+              try { createPayload.milestone = milestoneNumber(freshSrc); } catch {}
 
               peerIssue = await createIssue(peerOwner, peerRepo, createPayload);
 
-              // 写回源 issue 的映射（源 -> 对端）
-              const toPeerMark = buildPeerMark(peerOwner, peerRepo, peerIssue.number);
-              const cleanedSrcMain = stripManagedFromIssueBody(freshSrc.body || "");
+              // 写回源 issue：仅追加 origin + toPeer + write（避免污染正文）
+              const cleanedSrc = stripManagedFromIssueBody(freshSrc.body || "");
               const newSrcBody = [
-                cleanedSrcMain,
+                cleanedSrc,
                 "",
-                toPeerMark,
+                buildOriginMark(origin.login, origin.url),
+                buildPeerMark(peerOwner, peerRepo, peerIssue.number),
                 runWriteTag
               ].join("\n").trim();
 
@@ -251,59 +268,53 @@ jobs:
               core.info(`Found peer: ${peerRef.owner}/${peerRef.repo}#${peerRef.number}`);
             }
 
-            // ---------- 同步 Issue 字段（源 -> 对端） ----------
+            // ---------- 同步 issue 字段 ----------
             async function syncIssueFields(srcIssue, dstRef) {
-              const bodyMain = buildManagedIssueBodyForTarget(srcIssue);
-
-              // 目标仓库的 sync-peer 应当“回指源”（dst -> self）
-              const backToSrcMark = buildPeerMark(selfOwner, selfRepo, srcNumber);
-
+              const main = buildIssueBodyForTarget(srcIssue);
               const dstBody = [
-                bodyMain,
+                main,
                 "",
-                backToSrcMark,
+                buildOriginMark(origin.login, origin.url),
+                buildPeerMark(selfOwner, selfRepo, srcNumber),
                 runWriteTag
               ].join("\n").trim();
 
               const patch = { title: srcIssue.title, body: dstBody, state: srcIssue.state };
 
-              // 容错：不存在也不影响主同步
-              try { patch.labels = normalizeLabels(srcIssue); } catch (e) { core.info(`labels sync skipped: ${e.message}`); }
-              try { patch.assignees = normalizeAssignees(srcIssue); } catch (e) { core.info(`assignees sync skipped: ${e.message}`); }
-              try { patch.milestone = milestoneNumber(srcIssue); } catch (e) { core.info(`milestone sync skipped: ${e.message}`); }
+              try { patch.labels = normalizeLabels(srcIssue); } catch {}
+              try { patch.assignees = normalizeAssignees(srcIssue); } catch {}
+              try { patch.milestone = milestoneNumber(srcIssue); } catch {}
 
               await updateIssue(dstRef.owner, dstRef.repo, dstRef.number, patch);
             }
 
-            // ---------- 同步评论（增量去重 + 作者前缀） ----------
-            function commentTag(srcCommentId) {
-              return `<!-- sync-comment-id:${srcCommentId} -->`;
+            // ---------- 同步评论（作者前缀 + Synced from + 去重） ----------
+            function commentTag(id) {
+              return `<!-- sync-comment-id:${id} -->`;
             }
 
             async function syncComments(srcRef, dstRef) {
               const srcComments = await listAllComments(srcRef.owner, srcRef.repo, srcRef.number);
               const dstComments = await listAllComments(dstRef.owner, dstRef.repo, dstRef.number);
-
               const dstJoined = dstComments.map(c => c.body || "").join("\n");
 
               for (const c of srcComments) {
-                // 源评论若为同步写入则不再同步（防循环）
                 if (hasSyncWriteTag(c.body || "")) continue;
 
                 const tag = commentTag(c.id);
                 if (dstJoined.includes(tag)) continue;
 
-                const prefix = authorPrefixFromUser(c.user);
-                const main = (c.body || "").replace(WRITE_TAG_RE, "").replace(COMMENT_ID_RE, "").trim();
+                const u = userToLoginUrl(c.user);
+                const main = (c.body || "").replace(WRITE_RE, "").replace(COMMENT_ID_RE, "").trim();
 
                 const body = [
-                  `${prefix}`,
+                  authorPrefix(u.login, u.url),
                   "",
-                  `${main}`,
+                  main,
                   "",
                   "---",
-                  `${syncedFromLine(srcRef.owner, srcRef.repo, srcRef.number)}`,
-                  `${tag}`,
+                  syncedFromLine(srcRef.owner, srcRef.repo, srcRef.number),
+                  tag,
                   buildWriteTag(`${srcRef.owner}/${srcRef.repo}#${srcRef.number} comment run:${context.runId}`)
                 ].join("\n").trim();
 
@@ -319,7 +330,6 @@ jobs:
             const srcRef = { owner: selfOwner, repo: selfRepo, number: srcNumber };
             const dstRef = { owner: peerRef.owner, repo: peerRef.repo, number: peerRef.number };
 
-            // 每次事件：对齐 issue 字段，再补齐评论
             await syncIssueFields(freshSrc, dstRef);
             await syncComments(srcRef, dstRef);
 

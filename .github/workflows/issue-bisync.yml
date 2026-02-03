@@ -296,18 +296,28 @@ jobs:
             async function syncComments(srcRef, dstRef) {
               const srcComments = await listAllComments(srcRef.owner, srcRef.repo, srcRef.number);
               const dstComments = await listAllComments(dstRef.owner, dstRef.repo, dstRef.number);
-              const dstJoined = dstComments.map(c => c.body || "").join("\n");
-
+            
+              // 建立：srcCommentId -> dstComment
+              const map = new Map();
+              for (const dc of dstComments) {
+                const m = (dc.body || "").match(/<!--\s*sync-comment-id:(\d+)\s*-->/);
+                if (m) map.set(Number(m[1]), dc);
+              }
+            
               for (const c of srcComments) {
+                // 源评论若为同步写入则不再同步（防循环）
                 if (hasSyncWriteTag(c.body || "")) continue;
-
-                const tag = commentTag(c.id);
-                if (dstJoined.includes(tag)) continue;
-
+            
+                const srcId = c.id;
+                const tag = `<!-- sync-comment-id:${srcId} -->`;
+            
                 const u = userToLoginUrl(c.user);
-                const main = (c.body || "").replace(WRITE_RE, "").replace(COMMENT_ID_RE, "").trim();
-
-                const body = [
+                const main = (c.body || "")
+                  .replace(WRITE_RE, "")
+                  .replace(/<!--\s*sync-comment-id:\d+\s*-->/g, "")
+                  .trim();
+            
+                const desiredBody = [
                   authorPrefix(u.login, u.url),
                   "",
                   main,
@@ -317,13 +327,28 @@ jobs:
                   tag,
                   buildWriteTag(`${srcRef.owner}/${srcRef.repo}#${srcRef.number} comment run:${context.runId}`)
                 ].join("\n").trim();
-
-                await github.rest.issues.createComment({
-                  owner: dstRef.owner,
-                  repo: dstRef.repo,
-                  issue_number: dstRef.number,
-                  body
-                });
+            
+                const existing = map.get(srcId);
+            
+                if (!existing) {
+                  // 不存在 -> 新建
+                  await github.rest.issues.createComment({
+                    owner: dstRef.owner,
+                    repo: dstRef.repo,
+                    issue_number: dstRef.number,
+                    body: desiredBody
+                  });
+                } else {
+                  // 已存在 -> 更新（只有内容变了才更新，减少噪音）
+                  if ((existing.body || "").trim() !== desiredBody.trim()) {
+                    await github.rest.issues.updateComment({
+                      owner: dstRef.owner,
+                      repo: dstRef.repo,
+                      comment_id: existing.id,
+                      body: desiredBody
+                    });
+                  }
+                }
               }
             }
 

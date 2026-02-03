@@ -7,7 +7,6 @@ on:
     types: [created, edited]
   workflow_dispatch:
 
-# 这个 permissions 给 create-github-app-token 用即可；真正的跨仓库权限由 App token 提供
 permissions:
   contents: read
   issues: write
@@ -36,8 +35,6 @@ jobs:
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const core = require("@actions/core");
-
             const peerRepoFull = process.env.SYNC_PEER_REPO; // e.g. "xiaoheiCat/repoB"
             if (!peerRepoFull || !peerRepoFull.includes("/")) {
               core.setFailed("Missing/invalid vars.SYNC_PEER_REPO (expected owner/repo).");

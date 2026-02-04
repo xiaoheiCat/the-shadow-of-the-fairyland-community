@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   sync:
+    if: ${{ !github.event.issue.pull_request }}
     runs-on: ubuntu-latest
     steps:
       - name: Create GitHub App installation token (cross-repo)
